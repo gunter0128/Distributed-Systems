@@ -1,0 +1,17 @@
+# Web Framework
+Flask==3.0.0
+flask-sqlalchemy==3.1.1
+flask-cors==4.0.0
+mysql-connector-python==8.2.0
+PyMySQL==1.1.0  # Add PyMySQL
+
+# Authentication
+PyJWT==2.8.0
+python-jose==3.3.0
+passlib==1.7.4
+bcrypt==4.0.1
+
+# Utilities
+python-dotenv==1.0.0
+
+# Note: Removing unused dependencies to avoid conflicts
