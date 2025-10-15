@@ -1,0 +1,90 @@
+#!/bin/sh
+
+# 測試腳本是否正常執行
+/bin/echo "Hello World" >> /tmp/testfile.txt
+
+# 安裝必要依賴
+sudo yum install -y python3-pip python3 python3-setuptools -y
+/usr/bin/python3 -m pip install boto3 ec2_metadata uploadserver msgpack-rpc-python requests
+
+# 創建必要的目錄
+mkdir -p /home/ec2-user/files
+mkdir -p /home/ec2-user/chord-part-2
+mkdir -p /home/ec2-user/log
+
+# 設置適當的權限
+chmod -R 755 /home/ec2-user
+
+# 啟動 uploadserver 並記錄日誌
+nohup /usr/bin/python3 -m uploadserver 5058 --directory /home/ec2-user/files >/home/ec2-user/log/uploadserver.log 2>&1 &
+
+# 創建 start_chord.py 腳本
+cat <<EOF > /home/ec2-user/chord-part-2/start_chord.py
+import subprocess
+import boto3
+import requests
+import msgpackrpc
+import logging
+import os
+
+# Configuration
+CHORD_EXECUTABLE = "/home/ec2-user/chord-part-2/chord"
+PORT = 5057
+AUTO_SCALING_GROUP_NAME = "ChordAutoScaling"  # Replace with your Auto Scaling group name
+REGION = "us-east-1"  # Replace with your AWS region
+
+# 日誌文件路徑
+LOG_FILE = "/home/ec2-user/log/start_chord.log"
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s]: %(message)s"
+)
+
+def get_instance_id():
+    """Retrieve the instance ID of the current EC2 instance."""
+    try:
+        token = requests.put(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
+        ).text
+        instance_id = requests.get(
+            "http://169.254.169.254/latest/meta-data/instance-id",
+            headers={"X-aws-ec2-metadata-token": token}
+        ).text
+        return instance_id
+    except Exception as e:
+        logging.error(f"Error retrieving instance ID: {e}")
+        return None
+
+def start_chord_node(private_ip):
+    """Start the chord node."""
+    try:
+        subprocess.Popen([CHORD_EXECUTABLE, private_ip, str(PORT)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logging.info(f"Started Chord node on {private_ip}:{PORT}")
+    except Exception as e:
+        logging.error(f"Failed to start Chord node: {e}")
+
+def main():
+    try:
+        instance_id = get_instance_id()
+        if not instance_id:
+            logging.error("Unable to retrieve instance ID. Exiting.")
+            return
+
+        # 假設你有處理 Private IP 的邏輯
+        private_ip = "127.0.0.1"  # 測試用
+        start_chord_node(private_ip)
+    except Exception as e:
+        logging.error(f"Unexpected error in main: {e}")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# 設置腳本執行權限
+chmod +x /home/ec2-user/chord-part-2/start_chord.py
+
+# 使用 nohup 啟動 start_chord.py 並記錄日誌
+nohup /usr/bin/python3 /home/ec2-user/chord-part-2/start_chord.py >/home/ec2-user/log/start_chord_stdout.log 2>/home/ec2-user/log/start_chord_stderr.log &

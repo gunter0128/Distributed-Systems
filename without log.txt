@@ -1,0 +1,189 @@
+#!/bin/sh
+
+/bin/echo "Hello World" >> /tmp/testfile.txt
+sudo yum install -y python3-pip python3 python3-setuptools -y
+/usr/bin/python3 -m pip install boto3 ec2_metadata uploadserver
+
+# 創建必要目錄
+mkdir /home/ec2-user/files
+mkdir /home/ec2-user/chord-part-2
+
+# 啟動 uploadserver
+nohup /usr/bin/python3 -m uploadserver 5058 --directory /home/ec2-user/files >/dev/null 2>&1 &
+
+# 安裝依賴
+/usr/bin/python3 -m pip install msgpack-rpc-python requests
+
+# 動態創建 start_chord.py 腳本
+cat <<EOF > /home/ec2-user/chord-part-2/start_chord.py
+import subprocess
+import boto3
+import requests
+import msgpackrpc
+
+# Configuration
+CHORD_EXECUTABLE = "./chord"
+PORT = 5057
+AUTO_SCALING_GROUP_NAME = "ChordAutoScaling"  # Replace with your Auto Scaling group name
+REGION = "us-east-1"  # Replace with your AWS region
+
+# Initialize Boto3 clients
+autoscaling_client = boto3.client("autoscaling", region_name=REGION)
+ec2_client = boto3.client("ec2", region_name=REGION)
+
+def get_private_ips():
+    """Get private IPs of instances in the same Auto Scaling group."""
+    private_ips = []
+
+    # Get Auto Scaling group details
+    response = autoscaling_client.describe_auto_scaling_groups(
+        AutoScalingGroupNames=[AUTO_SCALING_GROUP_NAME]
+    )
+
+    if response["AutoScalingGroups"]:
+        instances = response["AutoScalingGroups"][0]["Instances"]
+        instance_ids = [instance["InstanceId"] for instance in instances]
+
+        # Get instance details
+        ec2_response = ec2_client.describe_instances(InstanceIds=instance_ids)
+        for reservation in ec2_response["Reservations"]:
+            for instance in reservation["Instances"]:
+                if instance["State"]["Name"] == "running":
+                    private_ips.append(instance["PrivateIpAddress"])
+
+    return private_ips
+
+def get_instance_id():
+    """Retrieve the instance ID of the current EC2 instance."""
+    try:
+        # 使用 IMDSv2 獲取 Instance ID
+        token = requests.put(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
+        ).text
+        instance_id = requests.get(
+            "http://169.254.169.254/latest/meta-data/instance-id",
+            headers={"X-aws-ec2-metadata-token": token}
+        ).text
+        return instance_id
+    except Exception as e:
+        print(f"Error retrieving instance ID: {e}")
+        return None
+
+def get_private_ip_from_boto3(instance_id):
+    """Retrieve the private IP address of the given EC2 instance using boto3."""
+    try:
+        ec2_client = boto3.client("ec2", region_name=REGION)
+        response = ec2_client.describe_instances(InstanceIds=[instance_id])
+        private_ip = response["Reservations"][0]["Instances"][0].get("PrivateIpAddress")
+        return private_ip
+    except Exception as e:
+        print(f"Error retrieving private IP from boto3: {e}")
+        return None
+
+def start_chord_node(private_ip):
+    """Start the chord node with the local private IP and port."""
+    subprocess.Popen([CHORD_EXECUTABLE, private_ip, str(PORT)])
+
+def new_client(ip, port):
+    """Create a new msgpackrpc client."""
+    return msgpackrpc.Client(msgpackrpc.Address(ip, port))
+
+def main():
+    try:
+        # Get the local private IP
+        instance_id = get_instance_id()
+        private_ip = get_private_ip_from_boto3(instance_id)
+        if not private_ip:
+            raise Exception("Unable to retrieve local private IP address.")
+
+        # Start the chord node
+        start_chord_node(private_ip)
+
+        # Check other nodes in the same Auto Scaling group
+        private_ips = get_private_ips()
+
+        # Remove own IP from the list (if it exists)
+        if private_ip in private_ips:
+            private_ips.remove(private_ip)
+
+        if not private_ips:
+            # If no other nodes, call 'create' RPC
+            print("No other nodes found. Creating a new chord ring.")
+            client = new_client(private_ip, PORT)
+            client.call("create")
+        else:
+            # Join the chord ring using the first available node
+            join_ip = private_ips[0]
+            node = new_client(join_ip, PORT)
+            client = new_client(private_ip, PORT)
+            client.call("join", node.call("get_info"))
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# 設置腳本為可執行
+chmod +x /home/ec2-user/chord-part-2/start_chord.py
+
+# 執行 start_chord.py
+cd /home/ec2-user/chord-part-2
+nohup /usr/bin/python3 /home/ec2-user/chord-part-2/start_chord.py >/dev/null 2>&1 &
+
+# 動態創建 killnode.py 腳本
+cat <<EOF > /usr/lib/systemd/system-shutdown/killnode.py
+#!/usr/bin/env python3
+import boto3
+import requests
+import msgpackrpc
+
+REGION = "us-east-1"  # 替換為當前 EC2 實例的區域
+
+def get_instance_id():
+    """Retrieve the instance ID of the current EC2 instance."""
+    try:
+        token = requests.put(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
+        ).text
+        instance_id = requests.get(
+            "http://169.254.169.254/latest/meta-data/instance-id",
+            headers={"X-aws-ec2-metadata-token": token}
+        ).text
+        return instance_id
+    except Exception as e:
+        print(f"Error retrieving instance ID: {e}")
+        return None
+
+def get_public_ip_from_boto3(instance_id):
+    """Retrieve the public IP address of the given EC2 instance using boto3."""
+    try:
+        ec2_client = boto3.client("ec2", region_name=REGION)
+        response = ec2_client.describe_instances(InstanceIds=[instance_id])
+        public_ip = response["Reservations"][0]["Instances"][0].get("PublicIpAddress")
+        return public_ip
+    except Exception as e:
+        print(f"Error retrieving public IP from boto3: {e}")
+        return None
+
+if __name__ == "__main__":
+    instance_id = get_instance_id()
+    if not instance_id:
+        print("Unable to retrieve Instance ID.")
+    else:
+        public_ip = get_public_ip_from_boto3(instance_id)
+        if public_ip:
+            try:
+                client = msgpackrpc.Client(msgpackrpc.Address(public_ip, 5057))
+                client.call("kill")
+                print(f"Node with IP {public_ip} killed successfully.")
+            except Exception as e:
+                print(f"Error during RPC call to kill node: {e}")
+        else:
+            print("Public IP not found for the instance.")
+EOF
+
+chmod +x /usr/lib/systemd/system-shutdown/killnode.py
